@@ -13,6 +13,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "MasterChef-stylus"
+version = "0.1.7"
+dependencies = [
+ "alloy-primitives",
+ "alloy-sol-types",
+ "ethers",
+ "eyre",
+ "hex",
+ "mini-alloc",
+ "stylus-sdk",
+ "tokio",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3217,20 +3231,6 @@ dependencies = [
  "quote",
  "rustversion",
  "syn 2.0.50",
-]
-
-[[package]]
-name = "stylus-hello-world"
-version = "0.1.7"
-dependencies = [
- "alloy-primitives",
- "alloy-sol-types",
- "ethers",
- "eyre",
- "hex",
- "mini-alloc",
- "stylus-sdk",
- "tokio",
 ]
 
 [[package]]
