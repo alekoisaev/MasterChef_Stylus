@@ -10,7 +10,7 @@ static ALLOC: mini_alloc::MiniAlloc = mini_alloc::MiniAlloc::INIT;
 use stylus_sdk::{
     alloy_primitives::{Address, U256},
     alloy_sol_types::sol,
-    block, msg,
+    block, contract, msg,
     prelude::*,
 };
 
@@ -76,6 +76,7 @@ sol! {
     error AlreadyInitialized();
     error NonOwner();
     error NotDevAddress();
+    error PoolDoesNotExist();
 }
 
 #[derive(SolidityError)]
@@ -83,12 +84,13 @@ pub enum MasterChefError {
     AlreadyInitialized(AlreadyInitialized),
     NonOwner(NonOwner),
     NotDevAddress(NotDevAddress),
+    PoolDoesNotExist(PoolDoesNotExist),
 }
 
 #[external]
 impl MasterChef {
     // Ownable functions...
-    // pub const BONUS_MULTIPLIER: U256 = 10;
+    pub const BONUS_MULTIPLIER: U256 = 10;
 
     pub fn pool_length(&self) -> U256 {
         U256::from(self.pool_info.len())
@@ -118,6 +120,11 @@ impl MasterChef {
     }
 
     /// Admin functions
+
+    /**
+     * Add a new lp to the pool. Can only be called by the owner.
+     * XXX DO NOT add the same LP token more than once. Rewards will be messed up if you do.
+     */
     pub fn add(
         &mut self,
         alloc_point: U256,
@@ -151,15 +158,35 @@ impl MasterChef {
         Ok(())
     }
 
-    pub fn set(&mut self) -> Result<(), MasterChefError> {
+    // Update the given pool's SUSHI allocation point. Can only be called by the owner.
+    pub fn set(
+        &mut self,
+        pid: U256,
+        alloc_point: U256,
+        with_update: bool,
+    ) -> Result<(), MasterChefError> {
         // onlyOwner modifier.
         if self.owner.get() != msg::sender() {
             return Err(MasterChefError::NonOwner(NonOwner {}));
         }
 
-        Ok(())
+        if with_update {
+            // massUpdatePools()
+        }
+
+        if let Some(mut pool_alloc_point) = self.pool_info.get_mut(pid) {
+            self.total_alloc_point.set(
+                self.total_alloc_point.get() - pool_alloc_point.alloc_point.get() + alloc_point,
+            );
+            pool_alloc_point.alloc_point.set(alloc_point);
+
+            Ok(())
+        } else {
+            return Err(MasterChefError::PoolDoesNotExist(PoolDoesNotExist {}));
+        }
     }
 
+    // Set the migrator contract. Can only be called by the owner.
     pub fn set_migrator(&mut self, migrator: Address) -> Result<(), MasterChefError> {
         // onlyOwner modifier.
         if self.owner.get() != msg::sender() {
@@ -169,6 +196,58 @@ impl MasterChef {
         self.migrator.set(migrator);
         Ok(())
     }
+
+    // Return reward multiplier over the given _from to _to block.
+    pub fn get_multiplier(&self, from: U256, to: U256) -> U256 {
+        if to <= self.bonus_end_block.get() {
+            (to - from) * Self::BONUS_MULTIPLIER
+        } else if from >= self.bonus_end_block.get() {
+            to - from
+        } else {
+            (self.bonus_end_block.get() - from) * Self::BONUS_MULTIPLIER + to
+                - self.bonus_end_block.get()
+        }
+    }
+
+    // View function to see pending SUSHIs on frontend.
+    pub fn pending_sushi(&self, pid: U256, user: Address) -> U256 {
+        let pool_info;
+        if let Some(pool) = self.pool_info.getter(pid) {
+            pool_info = pool
+        } else {
+            return U256::from(0);
+        }
+
+        let mut acc_sushi_per_share = pool_info.acc_sushi_per_share.get();
+        let lp_supply = IERC20::new(pool_info.lp_token.get())
+            .balance_of(self, contract::address())
+            .unwrap_or(U256::from(0));
+
+        let user_info = self.user_info.get(pid);
+        let user = user_info.get(user);
+
+        let block_number = U256::from(block::number());
+        if block_number > pool_info.last_reward_block.get() && lp_supply != U256::from(0) {
+            let multiplier = self.get_multiplier(pool_info.last_reward_block.get(), block_number);
+            let sushi_reward =
+                multiplier * self.sushi_per_block.get() * pool_info.alloc_point.get()
+                    / self.total_alloc_point.get();
+
+            acc_sushi_per_share =
+                acc_sushi_per_share + (sushi_reward * U256::from(1_000_000_000_000) / lp_supply);
+        }
+
+        return user.amount.get() * acc_sushi_per_share / U256::from(1_000_000_000_000)
+            - user.reward_debt.get();
+    }
+
+    // Update reward vairables for all pools. Be careful of gas spending!
+    // pub fn mass_update_pools(&self) {
+    //     let pool_length = self.pool_info.len();
+    //     for i in 0..pool_length {
+    //         // updatePool()
+    //     }
+    // }
 
     // Update dev address by the previous dev.
     pub fn dev(&mut self, dev_addr: Address) -> Result<(), MasterChefError> {
