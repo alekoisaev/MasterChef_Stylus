@@ -22,6 +22,7 @@ sol_interface! {
         function allowance(address owner, address spender) external view returns (uint256);
         function approve(address spender, uint256 value) external returns (bool);
         function transferFrom(address from, address to, uint256 value) external returns (bool);
+        function mint(address, uint256) external;
     }
 
     interface IMigratorChef {
@@ -59,6 +60,7 @@ sol_storage! {
         address dev_addr; // Dev address.
         uint256 bonus_end_block; // Block number when bonus SUSHI period ends.
         uint256 sushi_per_block; // SUSHI tokens created per block.
+        uint256 bonus_multiplier;
         // bonus multplier = 10;
         address migrator; // The migrator contract.
         PoolInfo[] pool_info; // Info of each pool.
@@ -89,15 +91,12 @@ pub enum MasterChefError {
 
 #[external]
 impl MasterChef {
-    // Ownable functions...
-    pub const BONUS_MULTIPLIER: U256 = 10;
-
     pub fn pool_length(&self) -> U256 {
         U256::from(self.pool_info.len())
     }
 
     /// Initialize - Constructor.
-    pub fn init(
+    pub fn initialize(
         &mut self,
         sushi: Address,
         dev_addr: Address,
@@ -114,6 +113,7 @@ impl MasterChef {
         self.dev_addr.set(dev_addr);
         self.bonus_end_block.set(bonus_end_block);
         self.sushi_per_block.set(sushi_per_block);
+        self.bonus_multiplier.set(U256::from(10));
         self.start_block.set(start_block);
 
         Ok(())
@@ -200,23 +200,22 @@ impl MasterChef {
     // Return reward multiplier over the given _from to _to block.
     pub fn get_multiplier(&self, from: U256, to: U256) -> U256 {
         if to <= self.bonus_end_block.get() {
-            (to - from) * Self::BONUS_MULTIPLIER
+            (to - from) * self.bonus_multiplier.get()
         } else if from >= self.bonus_end_block.get() {
             to - from
         } else {
-            (self.bonus_end_block.get() - from) * Self::BONUS_MULTIPLIER + to
+            (self.bonus_end_block.get() - from) * self.bonus_multiplier.get() + to
                 - self.bonus_end_block.get()
         }
     }
 
     // View function to see pending SUSHIs on frontend.
     pub fn pending_sushi(&self, pid: U256, user: Address) -> U256 {
-        let pool_info;
-        if let Some(pool) = self.pool_info.getter(pid) {
-            pool_info = pool
+        let pool_info = if let Some(pool) = self.pool_info.getter(pid) {
+            pool
         } else {
             return U256::from(0);
-        }
+        };
 
         let mut acc_sushi_per_share = pool_info.acc_sushi_per_share.get();
         let lp_supply = IERC20::new(pool_info.lp_token.get())
@@ -234,10 +233,10 @@ impl MasterChef {
                     / self.total_alloc_point.get();
 
             acc_sushi_per_share =
-                acc_sushi_per_share + (sushi_reward * U256::from(1_000_000_000_000) / lp_supply);
+                acc_sushi_per_share + (sushi_reward * U256::from(1_000_000_000_000u64) / lp_supply);
         }
 
-        return user.amount.get() * acc_sushi_per_share / U256::from(1_000_000_000_000)
+        return user.amount.get() * acc_sushi_per_share / U256::from(1_000_000_000_000u64)
             - user.reward_debt.get();
     }
 
@@ -245,9 +244,58 @@ impl MasterChef {
     // pub fn mass_update_pools(&self) {
     //     let pool_length = self.pool_info.len();
     //     for i in 0..pool_length {
-    //         // updatePool()
+    //         // self.update_pool(pid)
     //     }
     // }
+
+    pub fn update_pool(&mut self, pid: U256) -> Result<(), MasterChefError> {
+        let sushi_per_block = self.sushi_per_block.get();
+        let total_alloc_point = self.total_alloc_point.get();
+        let sushi_token_address = *self.sushi;
+        let dev_addr = self.dev_addr.get();
+
+        let lp_supply;
+        let multiplier;
+        let mut sushi_reward = U256::from(0);
+
+        if let Some(pool) = self.pool_info.getter(pid) {
+            if U256::from(block::number()) <= pool.last_reward_block.get() {
+                return Ok(());
+            }
+
+            lp_supply = IERC20::new(pool.lp_token.get())
+                .balance_of(&*self, contract::address())
+                .unwrap_or(U256::from(0));
+
+            multiplier =
+                self.get_multiplier(pool.last_reward_block.get(), U256::from(block::number()));
+        } else {
+            return Err(MasterChefError::PoolDoesNotExist(PoolDoesNotExist {}));
+        };
+
+        if let Some(mut pool_info) = self.pool_info.get_mut(pid) {
+            if lp_supply == U256::from(0) {
+                pool_info.last_reward_block.set(U256::from(block::number()));
+                return Ok(());
+            }
+
+            sushi_reward =
+                multiplier * sushi_per_block * pool_info.alloc_point.get() / total_alloc_point;
+
+            let acc_sushi_per_share = pool_info.acc_sushi_per_share.get()
+                + (sushi_reward * U256::from(1_000_000_000_000u64) / lp_supply);
+
+            pool_info.acc_sushi_per_share.set(acc_sushi_per_share);
+            pool_info.last_reward_block.set(U256::from(block::number()));
+        }
+
+        let sushi_token = IERC20::new(sushi_token_address);
+
+        let _ = sushi_token.mint(&mut *self, dev_addr, sushi_reward / U256::from(10));
+        let _ = sushi_token.mint(self, contract::address(), sushi_reward);
+
+        return Ok(());
+    }
 
     // Update dev address by the previous dev.
     pub fn dev(&mut self, dev_addr: Address) -> Result<(), MasterChefError> {
