@@ -22,9 +22,9 @@ eyre = "0.6.8"
 export-abi = ["stylus-sdk/export-abi"]
 debug = ["stylus-sdk/debug"]
 
-[[bin]]
-name = "master_chef_stylus"
-path = "src/main.rs"
+# [[bin]]
+# name = "master_chef_stylus"
+# path = "src/lib.rs"
 
 [lib]
 crate-type = ["lib", "cdylib"]

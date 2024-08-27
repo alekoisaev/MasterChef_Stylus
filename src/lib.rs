@@ -10,7 +10,7 @@ static ALLOC: mini_alloc::MiniAlloc = mini_alloc::MiniAlloc::INIT;
 use stylus_sdk::{
     alloy_primitives::{Address, U256},
     alloy_sol_types::sol,
-    block, contract, msg,
+    block, contract, evm, msg,
     prelude::*,
 };
 
@@ -79,6 +79,10 @@ sol! {
     error NonOwner();
     error NotDevAddress();
     error PoolDoesNotExist();
+    error UserNotStaked();
+    error NoMigratorExist();
+    error NotMigrated();
+    error InternalCallError();
 }
 
 #[derive(SolidityError)]
@@ -87,6 +91,10 @@ pub enum MasterChefError {
     NonOwner(NonOwner),
     NotDevAddress(NotDevAddress),
     PoolDoesNotExist(PoolDoesNotExist),
+    UserNotStaked(UserNotStaked),
+    NoMigratorExist(NoMigratorExist),
+    NotMigrated(NotMigrated),
+    InternalCallError(InternalCallError),
 }
 
 #[external]
@@ -137,7 +145,7 @@ impl MasterChef {
         }
 
         if with_update {
-            // massUpdatePool()
+            let _ = self.mass_update_pools();
         }
 
         let last_reward_block: U256 = if U256::from(block::timestamp()) > self.start_block.get() {
@@ -171,7 +179,7 @@ impl MasterChef {
         }
 
         if with_update {
-            // massUpdatePools()
+            let _ = self.mass_update_pools();
         }
 
         if let Some(mut pool_alloc_point) = self.pool_info.get_mut(pid) {
@@ -194,6 +202,44 @@ impl MasterChef {
         }
 
         self.migrator.set(migrator);
+        Ok(())
+    }
+
+    pub fn migrate(&mut self, pid: U256) -> Result<(), MasterChefError> {
+        if self.migrator.get() == Address::ZERO {
+            return Err(MasterChefError::NoMigratorExist(NoMigratorExist {}));
+        }
+
+        let new_lp_token;
+
+        if let Some(pool) = self.pool_info.getter(pid) {
+            let lp_token = pool.lp_token.get();
+
+            let bal = IERC20::new(lp_token)
+                .balance_of(&mut *self, contract::address())
+                .unwrap_or(U256::from(0));
+
+            new_lp_token = IMigratorChef::new(self.migrator.get())
+                .migrate(&mut *self, lp_token)
+                .unwrap_or(Address::ZERO);
+
+            let new_lp_token_bal = IERC20::new(new_lp_token)
+                .balance_of(&mut *self, contract::address())
+                .unwrap_or(U256::from(0));
+
+            if new_lp_token_bal != bal {
+                return Err(MasterChefError::NotMigrated(NotMigrated {}));
+            }
+        } else {
+            return Err(MasterChefError::PoolDoesNotExist(PoolDoesNotExist {}));
+        }
+
+        if let Some(mut pool_info) = self.pool_info.get_mut(pid) {
+            pool_info.lp_token.set(new_lp_token);
+        } else {
+            return Err(MasterChefError::PoolDoesNotExist(PoolDoesNotExist {}));
+        }
+
         Ok(())
     }
 
@@ -241,13 +287,21 @@ impl MasterChef {
     }
 
     // Update reward vairables for all pools. Be careful of gas spending!
-    // pub fn mass_update_pools(&self) {
-    //     let pool_length = self.pool_info.len();
-    //     for i in 0..pool_length {
-    //         // self.update_pool(pid)
-    //     }
-    // }
+    pub fn mass_update_pools(&mut self) -> Result<(), MasterChefError> {
+        let pool_length = self.pool_info.len();
+        for i in 0..pool_length {
+            let result = self.update_pool(U256::from(i));
 
+            match result {
+                Ok(_) => {}
+                Err(_) => return Err(MasterChefError::InternalCallError(InternalCallError {})),
+            }
+        }
+
+        return Ok(());
+    }
+
+    // Update reward variables of the given pool to be up-to-date.
     pub fn update_pool(&mut self, pid: U256) -> Result<(), MasterChefError> {
         let sushi_per_block = self.sushi_per_block.get();
         let total_alloc_point = self.total_alloc_point.get();
@@ -297,6 +351,151 @@ impl MasterChef {
         return Ok(());
     }
 
+    // Deposit LP tokens to MasterChef for SUSHI allocation.
+    pub fn deposit(&mut self, pid: U256, amount: U256) -> Result<(), MasterChefError> {
+        let result = self.update_pool(pid);
+        match result {
+            Ok(_) => {}
+            Err(_) => return Err(MasterChefError::InternalCallError(InternalCallError {})),
+        }
+
+        let lp_token;
+        let acc_sushi_per_share;
+        let user_amount;
+
+        if let Some(pool) = self.pool_info.getter(pid) {
+            lp_token = IERC20::new(pool.lp_token.get());
+            acc_sushi_per_share = pool.acc_sushi_per_share.get();
+        } else {
+            return Err(MasterChefError::PoolDoesNotExist(PoolDoesNotExist {}));
+        }
+
+        let binding = self.user_info.get(pid);
+        let user = binding.get(msg::sender());
+        user_amount = user.amount.get();
+
+        if user_amount > U256::from(0) {
+            let pending = user_amount * acc_sushi_per_share / U256::from(1_000_000_000_000u64)
+                - user.reward_debt.get();
+            let _ = self.safe_sushi_transfer(msg::sender(), pending);
+        }
+
+        let _ = lp_token.transfer_from(&mut *self, msg::sender(), contract::address(), amount);
+
+        let mut user_pool = self.user_info.setter(pid);
+        let mut user_info = user_pool.setter(msg::sender());
+
+        user_info.amount.set(user_amount + amount);
+        user_info
+            .reward_debt
+            .set((user_amount + amount) * acc_sushi_per_share / U256::from(1_000_000_000_000u64));
+
+        evm::log(Deposit {
+            user: msg::sender(),
+            pid,
+            amount,
+        });
+
+        Ok(())
+    }
+
+    // Withdraw LP tokens from MasterChef.
+    pub fn withdraw(&mut self, pid: U256, amount: U256) -> Result<(), MasterChefError> {
+        let user_amount = self.user_info.get(pid).get(msg::sender()).amount.get();
+        if user_amount < amount {
+            return Err(MasterChefError::UserNotStaked(UserNotStaked {}));
+        }
+
+        let _ = self.update_pool(pid);
+
+        let acc_sushi_per_share;
+        let user_reward_debt = self.user_info.get(pid).get(msg::sender()).reward_debt.get();
+        let lp_token;
+
+        if let Some(pool) = self.pool_info.getter(pid) {
+            acc_sushi_per_share = pool.acc_sushi_per_share.get();
+            lp_token = pool.lp_token.get();
+        } else {
+            return Err(MasterChefError::PoolDoesNotExist(PoolDoesNotExist {}));
+        }
+
+        let pending =
+            user_amount * acc_sushi_per_share / U256::from(1_000_000_000_000u64) - user_reward_debt;
+
+        let _ = self.safe_sushi_transfer(msg::sender(), pending);
+
+        let mut user_pool = self.user_info.setter(pid);
+        let mut user_info = user_pool.setter(msg::sender());
+
+        user_info.amount.set(user_amount - amount);
+        user_info
+            .reward_debt
+            .set(user_amount * acc_sushi_per_share / U256::from(1_000_000_000_000u64));
+
+        let _ = IERC20::new(lp_token).transfer(self, msg::sender(), amount);
+
+        evm::log(Withdraw {
+            user: msg::sender(),
+            pid,
+            amount,
+        });
+
+        Ok(())
+    }
+
+    // Withdraw without caring about rewards. EMERGENCY ONLY.
+    pub fn emergency_withdraw(&mut self, pid: U256) -> Result<(), MasterChefError> {
+        let user_amount = self.user_info.get(pid).get(msg::sender()).amount.get();
+
+        let lp_token;
+        if let Some(pool) = self.pool_info.getter(pid) {
+            lp_token = IERC20::new(pool.lp_token.get());
+        } else {
+            return Err(MasterChefError::PoolDoesNotExist(PoolDoesNotExist {}));
+        }
+
+        let _ = lp_token.transfer(&mut *self, msg::sender(), user_amount);
+
+        evm::log(EmergencyWithdraw {
+            user: msg::sender(),
+            pid,
+            amount: user_amount,
+        });
+
+        let mut user_pool = self.user_info.setter(pid);
+        let mut user_info = user_pool.setter(msg::sender());
+
+        user_info.amount.set(U256::from(0));
+        user_info.reward_debt.set(U256::from(0));
+
+        Ok(())
+    }
+
+    // Safe sushi transfer function, just in case if rounding error causes pool to not have enough SUSHIs.
+    pub fn safe_sushi_transfer(
+        &mut self,
+        to: Address,
+        amount: U256,
+    ) -> Result<(), MasterChefError> {
+        if msg::sender() != contract::address() {
+            return Err(MasterChefError::InternalCallError(InternalCallError {}));
+        }
+
+        let sushi = IERC20::new(self.sushi.get());
+
+        let sushi_bal = sushi
+            .balance_of(&*self, contract::address())
+            .unwrap_or(U256::from(0));
+
+        if amount > sushi_bal {
+            let _ = sushi.transfer(&mut *self, to, sushi_bal);
+        } else {
+            let _ = sushi.transfer(&mut *self, to, amount);
+        }
+
+        Ok(())
+    }
+
     // Update dev address by the previous dev.
     pub fn dev(&mut self, dev_addr: Address) -> Result<(), MasterChefError> {
         if self.dev_addr.get() != msg::sender() {
@@ -307,3 +506,29 @@ impl MasterChef {
         Ok(())
     }
 }
+
+// #[cfg(test)]
+// mod tests {
+
+//     use super::*;
+
+//     #[test]
+//     fn test_initialize() {
+//         let mut master_chef: MasterChef = unsafe { MasterChef::new(U256::from(0), 0u8) };
+
+//         // Define the addresses and parameters for initialization
+//         let sushi: Address = Address::from([0x11u8; 20]);
+//         let dev_addr: Address = Address::from([0x22u8; 20]);
+//         let bonus_end_block: U256 = U256::from(10);
+//         let sushi_per_block: U256 = U256::from(10);
+//         let start_block: U256 = U256::from(1);
+
+//         let _ = master_chef.initialize(
+//             sushi,
+//             dev_addr,
+//             bonus_end_block,
+//             sushi_per_block,
+//             start_block,
+//         );
+//     }
+// }
